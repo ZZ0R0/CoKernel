@@ -24,6 +24,11 @@ echo ""
 if [ -f /lib/modules/parasite.ko ]; then
     echo "[*] parasite.ko found in /lib/modules/"
     echo ""
+
+    # V3: Create target file for page cache reading BEFORE loading module
+    echo "CANARY_V3_TEST" > /tmp/test
+    echo "[*] Created /tmp/test with CANARY content"
+
     echo "=== Pre-load state ==="
     echo "[*] Modules loaded:"
     lsmod 2>/dev/null || cat /proc/modules
@@ -65,18 +70,25 @@ if [ -f /lib/modules/parasite.ko ]; then
         echo ""
         echo "=== Reading comm page (1st snapshot) ==="
         insmod /lib/modules/ck_reader.ko comm_phys="${COMM_PHYS}" 2>/dev/null
-        dmesg | grep 'ck_reader:' | tail -20
+        dmesg | grep 'ck_reader:' | tail -30
         sleep 2
         echo ""
         echo "=== Reading comm page (2nd snapshot, +2s) ==="
         insmod /lib/modules/ck_reader.ko comm_phys="${COMM_PHYS}" 2>/dev/null
-        dmesg | grep 'ck_reader:' | tail -20
+        dmesg | grep 'ck_reader:' | tail -30
 
         # V2: Compare co-kernel process list with ps output
         echo ""
         echo "=== Process List Comparison ==="
         echo "ps -eo pid,comm output:"
         ps -eo pid,comm 2>/dev/null || echo "(ps not available)"
+
+        # V3: Verify CANARY content was read from page cache
+        echo ""
+        echo "=== V3: Page Cache Verification ==="
+        echo "Expected file content: $(cat /tmp/test)"
+        echo "Co-kernel file read output:"
+        dmesg | grep 'ck_reader:.*File content' | tail -2
     elif [ -z "${COMM_PHYS}" ]; then
         echo "[!] Could not find comm_page_phys in dmesg"
     fi

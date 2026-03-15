@@ -1110,6 +1110,7 @@ deps_/data/share/cyber/CoKernel/module/parasite_main.o := \
   /usr/src/linux-headers-6.12.73+deb13-common/include/linux/vm_event_item.h \
     $(wildcard include/config/MEMORY_BALLOON) \
     $(wildcard include/config/BALLOON_COMPACTION) \
+  /usr/src/linux-headers-6.12.73+deb13-common/include/linux/namei.h \
   /usr/src/linux-headers-6.12.73+deb13-common/arch/x86/include/asm/io.h \
     $(wildcard include/config/MTRR) \
     $(wildcard include/config/X86_PAT) \

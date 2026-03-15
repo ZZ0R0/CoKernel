@@ -25,6 +25,9 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/xarray.h>
 #include <asm/io.h>
 #include <asm/msr.h>
 
@@ -38,6 +41,11 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("CoKernel PoC");
 MODULE_DESCRIPTION("Co-kernel parallel execution PoC");
+
+/* V3: target file path for page cache reading */
+static char *target_path = "/tmp/test";
+module_param(target_path, charp, 0444);
+MODULE_PARM_DESC(target_path, "Path of the file to read from page cache");
 
 /*
  * The co-kernel binary is embedded in the module as a byte array.
@@ -211,6 +219,31 @@ static int __init parasite_init(void)
     bd->offset_real_cred = offsetof(struct task_struct, real_cred);
     bd->offset_cred_uid  = offsetof(struct cred, uid);
 
+    /* V3: page cache reading offsets */
+    {
+        struct path fpath;
+        int path_ret = kern_path(target_path, LOOKUP_FOLLOW, &fpath);
+        if (path_ret == 0) {
+            struct inode *target_inode = d_inode(fpath.dentry);
+            bd->target_inode_dm = LINUX_DIRECT_MAP_BASE +
+                                  virt_to_phys(target_inode);
+            pr_info("cokernel: target file '%s' → inode_dm = 0x%llx\n",
+                    target_path, bd->target_inode_dm);
+            path_put(&fpath);
+        } else {
+            bd->target_inode_dm = 0;
+            pr_warn("cokernel: target file '%s' not found (err=%d)\n",
+                    target_path, path_ret);
+        }
+    }
+    bd->offset_i_mapping     = offsetof(struct inode, i_mapping);
+    bd->offset_i_size        = offsetof(struct inode, i_size);
+    bd->offset_a_i_pages     = offsetof(struct address_space, i_pages);
+    bd->offset_xa_head        = offsetof(struct xarray, xa_head);
+    bd->offset_xa_node_slots  = offsetof(struct xa_node, slots);
+    bd->vmemmap_base          = (uint64_t)(unsigned long)pfn_to_page(0);
+    bd->sizeof_struct_page    = (uint64_t)sizeof(struct page);
+
     pr_info("cokernel: bootstrap_data written at DATA offset 0x%lx\n",
             COKERNEL_DATA_OFFSET);
     pr_info("cokernel:   init_task_dm    = 0x%llx\n", bd->init_task_dm);
@@ -219,6 +252,13 @@ static int __init parasite_init(void)
     pr_info("cokernel:   offset_pid       = %llu\n", bd->offset_pid);
     pr_info("cokernel:   offset_real_cred = %llu\n", bd->offset_real_cred);
     pr_info("cokernel:   offset_cred_uid  = %llu\n", bd->offset_cred_uid);
+    pr_info("cokernel:   offset_i_mapping = %llu\n", bd->offset_i_mapping);
+    pr_info("cokernel:   offset_i_size    = %llu\n", bd->offset_i_size);
+    pr_info("cokernel:   offset_a_i_pages = %llu\n", bd->offset_a_i_pages);
+    pr_info("cokernel:   offset_xa_head   = %llu\n", bd->offset_xa_head);
+    pr_info("cokernel:   offset_xa_node_slots = %llu\n", bd->offset_xa_node_slots);
+    pr_info("cokernel:   vmemmap_base     = 0x%llx\n", bd->vmemmap_base);
+    pr_info("cokernel:   sizeof_struct_page = %llu\n", bd->sizeof_struct_page);
 
     /* ── Step 5: Build co-kernel page tables ───────────────────── */
     pr_info("cokernel: [5/9] Building page tables...\n");

@@ -74,8 +74,18 @@ struct ck_bootstrap_data {
     uint64_t offset_tgid;       /* offsetof(struct task_struct, tgid) */
     uint64_t offset_real_cred;  /* offsetof(struct task_struct, real_cred) */
     uint64_t offset_cred_uid;   /* offsetof(struct cred, uid) */
+
+    /* V3 additions: page cache reading */
+    uint64_t target_inode_dm;       /* DM address of target file inode (0=none) */
+    uint64_t offset_i_mapping;      /* offsetof(struct inode, i_mapping) */
+    uint64_t offset_i_size;         /* offsetof(struct inode, i_size) */
+    uint64_t offset_a_i_pages;      /* offsetof(struct address_space, i_pages) */
+    uint64_t offset_xa_head;        /* offsetof(struct xarray, xa_head) */
+    uint64_t offset_xa_node_slots;  /* offsetof(struct xa_node, slots) */
+    uint64_t vmemmap_base;          /* (unsigned long)pfn_to_page(0) */
+    uint64_t sizeof_struct_page;    /* sizeof(struct page) */
 };
-/* V2: 104 bytes (13 × 8). Written at COKERNEL_DATA_OFFSET. */
+/* V3: 168 bytes (21 × 8). Written at COKERNEL_DATA_OFFSET. */
 
 /*
  * Communication page — written by co-kernel on every PMI tick,
@@ -98,14 +108,32 @@ struct ck_comm_page {
 /*
  * Process snapshot entry (V2) — one per process in data_buf.
  *
- * data_buf layout:
- *   [0..3]   uint32_t nr_tasks
- *   [4..7]   uint32_t reserved
- *   [8..]    ck_process_entry[0..N-1]
+ * data_buf layout (V3 — split):
+ *   Zone 1: Process snapshot [0..1999]
+ *     [0..3]   uint32_t nr_tasks
+ *     [4..7]   uint32_t reserved
+ *     [8..]    ck_process_entry[0..61]
+ *   Zone 2: File content [2000..3999]
+ *     [2000..2003] uint32_t file_bytes
+ *     [2004..2007] uint32_t file_status
+ *     [2008..3999] uint8_t  file_content[1992]
  */
 #define SNAPSHOT_INTERVAL       512    /* take snapshot every N ticks */
-#define MAX_SNAPSHOT_PROCS      124    /* (4000 - 8) / 32 = 124 */
+#define MAX_SNAPSHOT_PROCS      62     /* (2000 - 8) / 32 = 62 */
 #define MAX_TASK_WALK           1024   /* safety limit on list traversal */
+
+/* V3: file content zone in data_buf */
+#define FILE_DATA_OFFSET        2000   /* offset in data_buf for file zone */
+#define MAX_FILE_CONTENT_SIZE   1992   /* 4000 - 2000 - 8 */
+#define XA_MAX_DEPTH            4      /* max xarray traversal depth */
+
+/* file_status codes */
+#define FILE_STATUS_OK          0
+#define FILE_STATUS_NO_INODE    1
+#define FILE_STATUS_NO_PAGE     2
+#define FILE_STATUS_UNSUPPORTED 3
+#define FILE_STATUS_BAD_PTR     4
+#define FILE_STATUS_TOO_DEEP    5
 
 struct ck_process_entry {
     int32_t  pid;

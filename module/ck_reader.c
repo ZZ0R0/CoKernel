@@ -27,7 +27,8 @@ module_param(comm_phys, ulong, 0444);
 MODULE_PARM_DESC(comm_phys, "Physical address of the comm page");
 
 #define COKERNEL_COMM_MAGIC  0x434B434F4D4D0001ULL
-#define MAX_SNAPSHOT_PROCS   124
+#define MAX_SNAPSHOT_PROCS   62
+#define FILE_DATA_OFFSET     2000
 
 struct ck_process_entry {
 	int32_t  pid;
@@ -92,6 +93,33 @@ static int __init ck_reader_init(void)
 		}
 
 		pr_info("ck_reader: --- End Snapshot ---\n");
+	}
+
+	/* V3: decode file content from data_buf */
+	{
+		uint32_t file_bytes  = *(uint32_t *)&cp->data_buf[FILE_DATA_OFFSET];
+		uint32_t file_status = *(uint32_t *)&cp->data_buf[FILE_DATA_OFFSET + 4];
+		const uint8_t *file_content = (const uint8_t *)&cp->data_buf[FILE_DATA_OFFSET + 8];
+		static const char * const status_names[] = {
+			"OK", "NO_INODE", "NO_PAGE", "UNSUPPORTED",
+			"BAD_PTR", "TOO_DEEP"
+		};
+		const char *sname = file_status < 6 ? status_names[file_status]
+						    : "UNKNOWN";
+
+		pr_info("ck_reader: --- File Content ---\n");
+		pr_info("ck_reader: file_status=%u (%s)\n", file_status, sname);
+		pr_info("ck_reader: file_bytes=%u\n", file_bytes);
+
+		if (file_status == 0 && file_bytes > 0) {
+			unsigned int show = file_bytes;
+			if (show > 256)
+				show = 256;
+			pr_info("ck_reader: File content (%u bytes): %.*s\n",
+				file_bytes, show, file_content);
+		}
+
+		pr_info("ck_reader: --- End File ---\n");
 	}
 
 	/* Return error to auto-unload — we only need the printk output */
