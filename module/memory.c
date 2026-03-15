@@ -79,10 +79,13 @@ int ck_alloc_invisible_memory(void)
      * Step 2: Remove pages from Linux's direct map.
      * After this, any access via the direct map window
      * (ffff888000000000 + phys) will page fault.
+     *
+     * V1: Skip the LAST page — it stays in Linux's direct map
+     * as the shared communication page, readable via /dev/mem.
      */
     vaddr = (unsigned long)page_address(ck_pages);
 
-    for (i = 0; i < ck_nr_pages; i++) {
+    for (i = 0; i < ck_nr_pages - 1; i++) {
         int ret = fn_set_direct_map_invalid(ck_pages + i);
         if (ret) {
             pr_err("cokernel: set_direct_map_invalid_noflush failed "
@@ -109,7 +112,8 @@ int ck_alloc_invisible_memory(void)
     for (i = 0; i < ck_nr_pages; i++)
         SetPageReserved(ck_pages + i);
 
-    pr_info("cokernel: %lu pages hidden from direct map\n", ck_nr_pages);
+    pr_info("cokernel: %lu pages hidden from direct map (1 comm page kept visible)\n",
+            ck_nr_pages - 1);
 
     return 0;
 }
@@ -221,4 +225,15 @@ void *ck_get_trampoline_va(void)
 phys_addr_t ck_get_trampoline_phys(void)
 {
     return ck_trampoline_phys;
+}
+
+/*
+ * ck_get_comm_page_phys — Return the physical address of the
+ * communication page (last page of the allocation).
+ */
+phys_addr_t ck_get_comm_page_phys(void)
+{
+    if (!ck_pages)
+        return 0;
+    return page_to_phys(ck_pages + ck_nr_pages - 1);
 }

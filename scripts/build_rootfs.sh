@@ -116,10 +116,35 @@ if [ -f /lib/modules/parasite.ko ]; then
     echo "[*] MemFree: $(grep MemFree /proc/meminfo)"
     echo ""
 
+    # Extract comm_page_phys from dmesg
+    COMM_PHYS=$(dmesg | grep 'comm_page_phys=' | sed 's/.*comm_page_phys=//' | tail -1)
+    echo "[*] Extracted COMM_PHYS: '${COMM_PHYS}'"
+
+    # Show full loader output for diagnostics
+    echo ""
+    echo "=== Loader dmesg output ==="
+    dmesg | grep 'cokernel:'
+    echo ""
+
     # Run verification
     if [ -f /root/verify.sh ]; then
-        echo "=== Running verification ==="
+        echo "=== Running invisibility verification ==="
         sh /root/verify.sh
+    fi
+
+    # Read comm page via ck_reader kernel module (bypasses /dev/mem restrictions)
+    if [ -n "${COMM_PHYS}" ] && [ -f /lib/modules/ck_reader.ko ]; then
+        echo ""
+        echo "=== Reading comm page (1st snapshot) ==="
+        insmod /lib/modules/ck_reader.ko comm_phys="${COMM_PHYS}" 2>/dev/null
+        dmesg | grep 'ck_reader:' | tail -8
+        sleep 2
+        echo ""
+        echo "=== Reading comm page (2nd snapshot, +2s) ==="
+        insmod /lib/modules/ck_reader.ko comm_phys="${COMM_PHYS}" 2>/dev/null
+        dmesg | grep 'ck_reader:' | tail -8
+    elif [ -z "${COMM_PHYS}" ]; then
+        echo "[!] Could not find comm_page_phys in dmesg"
     fi
 else
     echo "[!] parasite.ko not found — drop to shell"
@@ -128,6 +153,12 @@ fi
 echo ""
 echo "[*] Dropping to shell. Type 'poweroff -f' to exit."
 echo ""
+
+# Auto-poweroff if autotest on cmdline (for automated testing)
+if grep -q 'autotest' /proc/cmdline; then
+    echo "[*] autotest mode — powering off."
+    poweroff -f
+fi
 
 # Interactive shell
 exec /bin/sh
@@ -231,6 +262,20 @@ chmod +x "${ROOTFS_DIR}/root/verify.sh"
 if [ -f "${PROJECT_DIR}/module/parasite.ko" ]; then
     cp "${PROJECT_DIR}/module/parasite.ko" "${ROOTFS_DIR}/lib/modules/"
     echo "Module parasite.ko included in rootfs."
+fi
+
+# Copy ck_reader diagnostic module if built
+if [ -f "${PROJECT_DIR}/module/ck_reader.ko" ]; then
+    cp "${PROJECT_DIR}/module/ck_reader.ko" "${ROOTFS_DIR}/lib/modules/"
+    echo "Module ck_reader.ko included in rootfs."
+fi
+
+# Copy ck_verify tool if built
+if [ -f "${PROJECT_DIR}/build/ck_verify" ]; then
+    mkdir -p "${ROOTFS_DIR}/usr/bin"
+    cp "${PROJECT_DIR}/build/ck_verify" "${ROOTFS_DIR}/usr/bin/"
+    chmod +x "${ROOTFS_DIR}/usr/bin/ck_verify"
+    echo "Tool ck_verify included in rootfs."
 fi
 
 # ── Step 7: Pack rootfs ─────────────────────────────────────────

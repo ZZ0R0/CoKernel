@@ -11,6 +11,7 @@
 MODULE_NAME := parasite
 
 obj-m := $(MODULE_NAME).o
+obj-m += ck_reader.o
 
 $(MODULE_NAME)-y := parasite_main.o \
                     memory.o        \

@@ -1,31 +1,21 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * cokernel.c — Co-kernel payload
+ * cokernel.c — Co-kernel payload (V1)
  *
  * This is the core logic that executes inside the hidden memory region,
  * triggered by PMI hardware interrupts. It must:
  *   - Never call any Linux kernel function
- *   - Never access Linux data structures
- *   - Keep execution time < 5μs per invocation
+ *   - Keep execution time < 50μs per invocation
  *   - Use only its own stack and heap
+ *
+ * Design: ZERO dependency on .bss or .data sections.
+ * All pointers are computed from compile-time constants each call.
+ * The comm page's own magic field serves as the "initialized" flag:
+ *   magic == 0              → not yet initialized (GFP_ZERO)
+ *   magic == COKERNEL_COMM_MAGIC → initialized, normal heartbeat
  */
 
 #include "cokernel.h"
-
-/*
- * The communication page is at a fixed offset from our virtual base.
- * We compute the pointer using our base address. The loader places us
- * at COKERNEL_VIRT_BASE + COKERNEL_TEXT_OFFSET. The comm page is at
- * COKERNEL_VIRT_BASE + COKERNEL_COMM_OFFSET.
- *
- * Since we're compiled position-independent and loaded at a known
- * address, we use absolute addresses.
- */
-static volatile struct cokernel_comm *comm =
-    (volatile struct cokernel_comm *)(COKERNEL_VIRT_BASE + COKERNEL_COMM_OFFSET);
-
-/* Internal tick counter (redundant with comm, but local cache) */
-static uint64_t local_ticks;
 
 /*
  * Read the TSC (Time Stamp Counter) — inline, no kernel dependency.
@@ -38,31 +28,52 @@ static inline uint64_t rdtsc_native(void)
 }
 
 /*
- * cokernel_init — One-time initialization.
- * Called by the loader module after copying the binary into hidden pages.
+ * Minimal memcpy — no libc available in freestanding mode.
  */
-void cokernel_init(void)
+static void memcpy_ck(void *dst, const void *src, unsigned long n)
 {
-    local_ticks = 0;
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--)
+        *d++ = *s++;
 }
 
 /*
- * component_tick — Main entry point called on each PMI.
+ * component_tick — Sole entry point, called on each PMI.
  *
- * This function must be fast and deterministic. It:
- *   1. Increments the tick counter
- *   2. Records the current TSC
- *   3. Updates the status field
+ * Self-initializing: on the very first call the comm page magic is 0
+ * (memory was zeroed by GFP_ZERO). We detect this and run one-time
+ * initialization before entering the normal heartbeat path.
  *
- * For PoC purposes, this demonstrates that the co-kernel is alive
- * and executing periodically via hardware interrupts.
+ * No static variables are used — everything is derived from
+ * compile-time constants (COKERNEL_VIRT_BASE + offsets).
  */
+__attribute__((section(".text.entry")))
 void component_tick(void)
 {
-    local_ticks++;
+    /* Comm page: always at a fixed, known address */
+    volatile struct ck_comm_page *comm =
+        (volatile struct ck_comm_page *)(COKERNEL_VIRT_BASE + COKERNEL_COMM_OFFSET);
 
-    comm->tick_count = local_ticks;
+    /* Heartbeat — written EVERY tick, unconditionally */
+    comm->tick_count++;
     comm->last_tsc = rdtsc_native();
-    comm->status = 1;  /* running */
-    comm->magic = COKERNEL_MAGIC;
+
+    /* First-tick initialization: magic is 0 (page was zeroed) */
+    if (comm->magic != COKERNEL_COMM_MAGIC) {
+        struct ck_bootstrap_data *boot =
+            (struct ck_bootstrap_data *)(COKERNEL_VIRT_BASE + COKERNEL_DATA_OFFSET);
+
+        comm->magic   = COKERNEL_COMM_MAGIC;
+        comm->version = 1;
+        comm->status  = 1;  /* running */
+
+        /* Read init_task.comm via Linux direct map */
+        if (boot->magic == COKERNEL_BOOTSTRAP_MAGIC) {
+            const char *task_comm = (const char *)
+                (boot->init_task_dm + boot->offset_task_comm);
+            memcpy_ck((void *)comm->init_comm, task_comm, 16);
+            comm->data_seq = 1;
+        }
+    }
 }

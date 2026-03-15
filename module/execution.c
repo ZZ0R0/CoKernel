@@ -6,6 +6,10 @@
  * interrupts (PMI) every N CPU cycles. The interrupt fires vector
  * 0x42 which jumps to our handler via the IDT.
  *
+ * Supports both Intel (Fixed Counter 0) and AMD (Core PerfEvtSel0/PerfCtr0).
+ * Detects CPU vendor and x2APIC mode, patching the trampoline data block
+ * so the assembly handler uses the correct MSRs and EOI method.
+ *
  * No kernel function is hooked. No text is patched. The execution
  * source is purely hardware-driven.
  */
@@ -20,25 +24,51 @@
 #include "../include/shared.h"
 #include "execution.h"
 
+/* ── AMD Core Performance Counter MSRs ───────────────────────── */
+#define AMD_MSR_PERF_EVT_SEL0   0xC0010200
+#define AMD_MSR_PERF_CTR0       0xC0010201
+
 /*
- * Direct LAPIC register write — avoids apic_write() which uses
- * unexported static calls. Supports both x2APIC (MSR) and
- * xAPIC (MMIO) modes.
+ * AMD PerfEvtSel0 event selector for "CPU Cycles Not Halted":
+ *   Event 0x76 = CPU Clocks Not Halted
+ *   UnitMask = 0x00
+ *   USR (bit 16) = 1, OS (bit 17) = 1
+ *   EN (bit 22) = 1   — enable counter
+ *   INT (bit 20) = 1  — interrupt on overflow
  */
+#define AMD_EVTSEL_CYCLES_NOT_HALTED  \
+    (0x76ULL | (0x00ULL << 8) | (1ULL << 16) | (1ULL << 17) | \
+     (1ULL << 20) | (1ULL << 22))
+
+/* ── LAPIC ────────────────────────────────────────────────────── */
 #define MSR_X2APIC_BASE        0x800
 #define XAPIC_DEFAULT_PHYS     0xFEE00000UL
 
-static void ck_lapic_write(u32 reg, u32 val)
+static int is_amd_cpu;
+static int is_x2apic;
+
+void ck_detect_cpu_features(void)
 {
+    u32 eax, ebx, ecx, edx;
     u64 apic_base;
 
-    rdmsrl(MSR_IA32_APICBASE, apic_base);
+    cpuid(0, &eax, &ebx, &ecx, &edx);
+    /* AMD: ebx='Auth' edx='enti' ecx='cAMD' → check ebx */
+    is_amd_cpu = (ebx == 0x68747541); /* "Auth" */
 
-    if (apic_base & (1ULL << 10)) {
-        /* x2APIC mode — MSR access */
+    rdmsrl(MSR_IA32_APICBASE, apic_base);
+    is_x2apic = !!(apic_base & (1ULL << 10));
+
+    pr_info("cokernel: CPU vendor=%s, x2APIC=%s\n",
+            is_amd_cpu ? "AMD" : "Intel",
+            is_x2apic ? "yes" : "no");
+}
+
+static void ck_lapic_write(u32 reg, u32 val)
+{
+    if (is_x2apic) {
         wrmsrl(MSR_X2APIC_BASE + (reg >> 4), val);
     } else {
-        /* xAPIC mode — direct MMIO */
         void __iomem *base = ioremap(XAPIC_DEFAULT_PHYS, PAGE_SIZE);
         if (base) {
             writel(val, base + reg);
@@ -48,15 +78,7 @@ static void ck_lapic_write(u32 reg, u32 val)
 }
 
 /*
- * IDT gate descriptor format (x86-64, 16 bytes):
- *
- *   Bytes 0-1:  offset[15:0]
- *   Bytes 2-3:  segment selector (usually __KERNEL_CS = 0x10)
- *   Byte  4:    IST (bits 2:0) | reserved
- *   Byte  5:    type (0xE = interrupt gate) | DPL | Present
- *   Bytes 6-7:  offset[31:16]
- *   Bytes 8-11: offset[63:32]
- *   Bytes 12-15: reserved (must be 0)
+ * IDT gate descriptor format (x86-64, 16 bytes)
  */
 struct idt_gate {
     uint16_t offset_low;
@@ -68,12 +90,6 @@ struct idt_gate {
     uint32_t reserved;
 } __attribute__((packed));
 
-/*
- * ck_install_idt_handler — Write a gate descriptor into the IDT.
- *
- * We read the current IDTR to find the IDT base, then overwrite
- * the entry at the given vector index.
- */
 int ck_install_idt_handler(unsigned int vector, void *handler)
 {
     struct desc_ptr idtr;
@@ -86,7 +102,6 @@ int ck_install_idt_handler(unsigned int vector, void *handler)
         return -EINVAL;
     }
 
-    /* Read IDTR — gives us base and limit of IDT */
     store_idt(&idtr);
 
     if ((vector * sizeof(struct idt_gate)) > idtr.size) {
@@ -96,18 +111,15 @@ int ck_install_idt_handler(unsigned int vector, void *handler)
 
     idt = (struct idt_gate *)idtr.address;
 
-    /* Build interrupt gate descriptor */
     memset(&gate, 0, sizeof(gate));
     gate.offset_low  = (uint16_t)(addr & 0xFFFF);
     gate.segment     = __KERNEL_CS;
-    gate.ist         = 0;    /* No IST — use current stack */
-    gate.type_attr   = 0x8E; /* Present, DPL=0, Type=Interrupt Gate */
+    gate.ist         = 0;
+    gate.type_attr   = 0x8E;  /* Present, DPL=0, Interrupt Gate */
     gate.offset_mid  = (uint16_t)((addr >> 16) & 0xFFFF);
     gate.offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
     gate.reserved    = 0;
 
-    /* Write the gate — must bypass W/P since IDT is read-only mapped.
-     * Use raw asm to avoid CR pinning checks in native_write_cr0(). */
     {
         unsigned long cr0;
         unsigned long flags;
@@ -127,66 +139,77 @@ int ck_install_idt_handler(unsigned int vector, void *handler)
 /*
  * ck_setup_pmi_execution — Configure PMU + LAPIC for periodic PMI.
  *
- * Uses IA32_FIXED_CTR0 (instruction retired or unhalted cycles,
- * depending on the CPU model — we use it as cycle counter).
+ * On AMD:  Uses PerfEvtSel0/PerfCtr0 (MSR 0xC0010200/0xC0010201)
+ * On Intel: Uses IA32_FIXED_CTR0 (MSR 0x309) + control MSRs
  *
- * The counter is preset to -(PMI_INTERVAL) so it overflows after
- * PMI_INTERVAL cycles, generating a PMI on the configured vector.
+ * The trampoline data block is patched with the correct MSR addresses
+ * so the assembly handler reloads the right counter.
  */
 int ck_setup_pmi_execution(void *handler_addr)
 {
     int ret;
     uint64_t val;
 
+    /* ck_detect_cpu_features() must be called before this function */
+    /* so that is_amd_cpu and is_x2apic are already set.            */
+
     /* Step 1: Install IDT handler */
     ret = ck_install_idt_handler(PMI_VECTOR, handler_addr);
     if (ret)
         return ret;
 
-    /*
-     * Step 2: Configure IA32_FIXED_CTR_CTRL (MSR 0x38D)
-     *
-     * Bits [3:0] control Fixed Counter 0:
-     *   Bit 0: count in OS mode (Ring 0)     → 1
-     *   Bit 1: count in User mode (Ring 3)   → 1
-     *   Bit 3: enable PMI on overflow        → 1
-     * = 0xB
-     *
-     * We only touch bits [3:0], preserving other counters.
-     */
-    rdmsrl(MSR_IA32_FIXED_CTR_CTRL, val);
-    val &= ~0xFULL;            /* Clear bits for CTR0 */
-    val |= 0xBULL;             /* OS + User + PMI */
-    wrmsrl(MSR_IA32_FIXED_CTR_CTRL, val);
+    if (is_amd_cpu) {
+        /*
+         * AMD: Use Core Performance Counter 0.
+         *
+         * 1. Disable counter first (clear EN bit in EvtSel0)
+         * 2. Preset counter to -(interval)
+         * 3. Configure EvtSel0: event + OS + USR + INT + EN
+         */
+        wrmsrl(AMD_MSR_PERF_EVT_SEL0, 0);
+        wrmsrl(AMD_MSR_PERF_CTR0, PMI_RELOAD_VALUE);
+        wrmsrl(AMD_MSR_PERF_EVT_SEL0, AMD_EVTSEL_CYCLES_NOT_HALTED);
 
-    pr_info("cokernel: IA32_FIXED_CTR_CTRL = 0x%llx\n", val);
+        rdmsrl(AMD_MSR_PERF_EVT_SEL0, val);
+        pr_info("cokernel: AMD PerfEvtSel0 = 0x%llx\n", val);
+        rdmsrl(AMD_MSR_PERF_CTR0, val);
+        pr_info("cokernel: AMD PerfCtr0 = 0x%llx\n", val);
+    } else {
+        /* Intel: Use Fixed Counter 0 */
+        rdmsrl(MSR_IA32_FIXED_CTR_CTRL, val);
+        val &= ~0xFULL;
+        val |= 0xBULL;  /* OS + User + PMI */
+        wrmsrl(MSR_IA32_FIXED_CTR_CTRL, val);
+        pr_info("cokernel: IA32_FIXED_CTR_CTRL = 0x%llx\n", val);
 
-    /*
-     * Step 3: Preset the counter to overflow after PMI_INTERVAL cycles.
-     * IA32_FIXED_CTR0 (MSR 0x309)
-     */
-    wrmsrl(MSR_IA32_FIXED_CTR0, PMI_RELOAD_VALUE);
+        wrmsrl(MSR_IA32_FIXED_CTR0, PMI_RELOAD_VALUE);
+        pr_info("cokernel: IA32_FIXED_CTR0 = 0x%llx\n", PMI_RELOAD_VALUE);
 
-    pr_info("cokernel: IA32_FIXED_CTR0 preset to 0x%llx (interval=%llu)\n",
-            PMI_RELOAD_VALUE, PMI_INTERVAL);
+        rdmsrl(MSR_IA32_PERF_GLOBAL_CTRL, val);
+        val |= (1ULL << 32);
+        wrmsrl(MSR_IA32_PERF_GLOBAL_CTRL, val);
+        pr_info("cokernel: IA32_PERF_GLOBAL_CTRL = 0x%llx\n", val);
+    }
 
-    /*
-     * Step 4: Enable Fixed Counter 0 in IA32_PERF_GLOBAL_CTRL (MSR 0x38F)
-     * Bit 32 = enable Fixed CTR0.
-     */
-    rdmsrl(MSR_IA32_PERF_GLOBAL_CTRL, val);
-    val |= (1ULL << 32);
-    wrmsrl(MSR_IA32_PERF_GLOBAL_CTRL, val);
-
-    pr_info("cokernel: IA32_PERF_GLOBAL_CTRL = 0x%llx\n", val);
-
-    /*
-     * Step 5: Configure LAPIC LVT Performance Counter → our vector.
-     * This tells the LAPIC to deliver PMI as interrupt vector 0x42.
-     */
-    ck_lapic_write(0x340 /* APIC_LVTPC */, PMI_VECTOR);
-
+    /* Configure LAPIC LVT Performance Counter → our vector */
+    ck_lapic_write(0x340, PMI_VECTOR);
     pr_info("cokernel: LAPIC LVT_PC → vector 0x%02x\n", PMI_VECTOR);
 
     return 0;
+}
+
+/*
+ * ck_get_is_amd — Expose CPU vendor to the loader for trampoline patching.
+ */
+int ck_get_is_amd(void)
+{
+    return is_amd_cpu;
+}
+
+/*
+ * ck_get_is_x2apic — Expose APIC mode to the loader.
+ */
+int ck_get_is_x2apic(void)
+{
+    return is_x2apic;
 }

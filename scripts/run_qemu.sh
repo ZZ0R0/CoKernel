@@ -54,6 +54,16 @@ if [ -f "${PROJECT_DIR}/module/parasite.ko" ]; then
     ROOTFS_DIR="${BUILD_DIR}/rootfs"
     if [ -d "${ROOTFS_DIR}" ]; then
         cp "${PROJECT_DIR}/module/parasite.ko" "${ROOTFS_DIR}/lib/modules/"
+        # Also copy ck_reader.ko if built
+        if [ -f "${PROJECT_DIR}/module/ck_reader.ko" ]; then
+            cp "${PROJECT_DIR}/module/ck_reader.ko" "${ROOTFS_DIR}/lib/modules/"
+        fi
+        # Also update ck_verify if built
+        if [ -f "${PROJECT_DIR}/build/ck_verify" ]; then
+            mkdir -p "${ROOTFS_DIR}/usr/bin"
+            cp "${PROJECT_DIR}/build/ck_verify" "${ROOTFS_DIR}/usr/bin/"
+            chmod +x "${ROOTFS_DIR}/usr/bin/ck_verify"
+        fi
         cd "${ROOTFS_DIR}"
         find . -print0 | cpio --null -ov --format=newc 2>/dev/null | \
             gzip -9 > "${BUILD_DIR}/rootfs.cpio.gz"
@@ -95,7 +105,7 @@ exec qemu-system-x86_64 \
     -m 1024 \
     -kernel "${BZIMAGE}" \
     -initrd "${INITRD}" \
-    -append "console=ttyS0 nokaslr quiet" \
+    -append "console=ttyS0 nokaslr iomem=relaxed autotest" \
     -nographic \
     -no-reboot \
     "$@"

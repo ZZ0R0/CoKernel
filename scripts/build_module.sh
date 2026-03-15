@@ -75,6 +75,10 @@ if [ -f "${PROJECT_DIR}/module/parasite.ko" ]; then
     echo "Module: ${PROJECT_DIR}/module/parasite.ko"
     echo "Size:   $(du -h "${PROJECT_DIR}/module/parasite.ko" | cut -f1)"
     modinfo "${PROJECT_DIR}/module/parasite.ko" 2>/dev/null || true
+    if [ -f "${PROJECT_DIR}/module/ck_reader.ko" ]; then
+        echo "Reader: ${PROJECT_DIR}/module/ck_reader.ko"
+        echo "Size:   $(du -h "${PROJECT_DIR}/module/ck_reader.ko" | cut -f1)"
+    fi
 else
     echo "ERROR: parasite.ko not produced"
     exit 1

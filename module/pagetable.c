@@ -37,6 +37,7 @@
 #define PTE_WRITABLE    (1ULL << 1)
 #define PTE_ACCESSED    (1ULL << 5)
 #define PTE_DIRTY       (1ULL << 6)
+#define PTE_PSE         (1ULL << 7)     /* Page Size — 2 MB page in PMD */
 #define PTE_GLOBAL      (1ULL << 8)
 #define PTE_NX          (1ULL << 63)
 
@@ -143,6 +144,59 @@ static int map_page(uint64_t *pgd, unsigned long virt,
 }
 
 /*
+ * Map a single 2 MB huge page in the co-kernel's page tables.
+ * Walks PGD → PUD → PMD, then sets a 2 MB page entry (PSE bit).
+ *
+ * If the PMD entry already exists (e.g. a 4KB PTE table from the
+ * trampoline mapping), the entry is skipped to avoid conflicts.
+ */
+static int map_page_2m(uint64_t *pgd, unsigned long virt,
+                       phys_addr_t phys, uint64_t flags)
+{
+    unsigned int pgd_idx = (virt >> 39) & 0x1FF;
+    unsigned int pud_idx = (virt >> 30) & 0x1FF;
+    unsigned int pmd_idx = (virt >> 21) & 0x1FF;
+    uint64_t *pud, *pmd;
+    phys_addr_t tbl_phys;
+
+    /* PGD → PUD */
+    if (!(pgd[pgd_idx] & PTE_PRESENT)) {
+        pud = pgt_alloc_page(&tbl_phys);
+        if (!pud) return -ENOMEM;
+        pgd[pgd_idx] = tbl_phys | PT_FLAGS_RWX;
+    } else {
+        phys_addr_t pud_phys = pgd[pgd_idx] & ~0xFFFULL;
+        pud = (uint64_t *)((unsigned long)pgt_base +
+                           (pud_phys - pgt_phys));
+        if (pud_phys < pgt_phys ||
+            pud_phys >= pgt_phys + COKERNEL_PGT_SIZE)
+            return -EINVAL;
+    }
+
+    /* PUD → PMD */
+    if (!(pud[pud_idx] & PTE_PRESENT)) {
+        pmd = pgt_alloc_page(&tbl_phys);
+        if (!pmd) return -ENOMEM;
+        pud[pud_idx] = tbl_phys | PT_FLAGS_RWX;
+    } else {
+        phys_addr_t pmd_phys = pud[pud_idx] & ~0xFFFULL;
+        pmd = (uint64_t *)((unsigned long)pgt_base +
+                           (pmd_phys - pgt_phys));
+        if (pmd_phys < pgt_phys ||
+            pmd_phys >= pgt_phys + COKERNEL_PGT_SIZE)
+            return -EINVAL;
+    }
+
+    /* PMD → 2 MB page (skip if entry already occupied) */
+    if (pmd[pmd_idx] & PTE_PRESENT)
+        return 0;
+
+    pmd[pmd_idx] = (phys & ~0x1FFFFFULL) | flags;
+
+    return 0;
+}
+
+/*
  * ck_build_pagetables — Build the co-kernel's page table hierarchy.
  *
  * @region_base:     temp vmap of the entire co-kernel region
@@ -231,6 +285,49 @@ int ck_build_pagetables(void *region_base, phys_addr_t phys_base,
     }
 
     pr_info("cokernel: page tables built, %lu bytes used\n", pgt_offset);
+    return 0;
+}
+
+/*
+ * ck_map_linux_physmem — Map physical RAM into the co-kernel's CR3
+ * at LINUX_DIRECT_MAP_BASE using 2 MB huge pages.
+ *
+ * Must be called AFTER ck_build_pagetables() (uses the same PGD
+ * and page table allocator state).
+ *
+ * The 2 MB region containing the trampoline is mapped RWX so the
+ * PMI handler can execute after CR3 switch. All other regions are RW+NX.
+ */
+int ck_map_linux_physmem(unsigned long ram_size, phys_addr_t trampoline_phys)
+{
+    unsigned long offset;
+    uint64_t *pgd;
+    int ret;
+
+    /* Reconstruct PGD virtual pointer from statics */
+    pgd = (uint64_t *)((unsigned long)pgt_base + (pgd_phys - pgt_phys));
+
+    for (offset = 0; offset < ram_size; offset += (2UL << 20)) {
+        uint64_t flags = PT_FLAGS_RW | PTE_PSE;
+
+        /* The 2 MB region containing the trampoline must be executable */
+        if (trampoline_phys >= offset &&
+            trampoline_phys < offset + (2UL << 20))
+            flags = PT_FLAGS_RWX | PTE_PSE;
+
+        ret = map_page_2m(pgd, LINUX_DIRECT_MAP_BASE + offset,
+                          offset, flags);
+        if (ret) {
+            pr_err("cokernel: map_page_2m failed at offset 0x%lx: %d\n",
+                   offset, ret);
+            return ret;
+        }
+    }
+
+    pr_info("cokernel: mapped %lu MB of physical RAM at 0x%lx\n",
+            ram_size / (1024 * 1024), (unsigned long)LINUX_DIRECT_MAP_BASE);
+    pr_info("cokernel: page tables now using %lu bytes\n", pgt_offset);
+
     return 0;
 }
 

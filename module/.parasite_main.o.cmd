@@ -1054,8 +1054,6 @@ deps_/data/share/cyber/CoKernel/module/parasite_main.o := \
   /usr/src/linux-headers-6.12.73+deb13-common/include/linux/delay.h \
   /usr/src/linux-headers-6.12.73+deb13-common/arch/x86/include/asm/delay.h \
   /usr/src/linux-headers-6.12.73+deb13-common/include/asm-generic/delay.h \
-  /data/share/cyber/CoKernel/module/../include/shared.h \
-  /data/share/cyber/CoKernel/module/memory.h \
   /usr/src/linux-headers-6.12.73+deb13-common/include/linux/mm.h \
     $(wildcard include/config/HAVE_ARCH_MMAP_RND_BITS) \
     $(wildcard include/config/HAVE_ARCH_MMAP_RND_COMPAT_BITS) \
@@ -1112,6 +1110,28 @@ deps_/data/share/cyber/CoKernel/module/parasite_main.o := \
   /usr/src/linux-headers-6.12.73+deb13-common/include/linux/vm_event_item.h \
     $(wildcard include/config/MEMORY_BALLOON) \
     $(wildcard include/config/BALLOON_COMPACTION) \
+  /usr/src/linux-headers-6.12.73+deb13-common/arch/x86/include/asm/io.h \
+    $(wildcard include/config/MTRR) \
+    $(wildcard include/config/X86_PAT) \
+  arch/x86/include/generated/asm/early_ioremap.h \
+  /usr/src/linux-headers-6.12.73+deb13-common/include/asm-generic/early_ioremap.h \
+    $(wildcard include/config/GENERIC_EARLY_IOREMAP) \
+  /usr/src/linux-headers-6.12.73+deb13-common/arch/x86/include/asm/shared/io.h \
+  /usr/src/linux-headers-6.12.73+deb13-common/include/asm-generic/io.h \
+    $(wildcard include/config/GENERIC_IOMAP) \
+    $(wildcard include/config/TRACE_MMIO_ACCESS) \
+    $(wildcard include/config/GENERIC_IOREMAP) \
+    $(wildcard include/config/HAS_IOPORT_MAP) \
+  /usr/src/linux-headers-6.12.73+deb13-common/include/asm-generic/iomap.h \
+  /usr/src/linux-headers-6.12.73+deb13-common/include/asm-generic/pci_iomap.h \
+    $(wildcard include/config/PCI) \
+    $(wildcard include/config/NO_GENERIC_PCI_IOPORT_MAP) \
+    $(wildcard include/config/GENERIC_PCI_IOMAP) \
+  /usr/src/linux-headers-6.12.73+deb13-common/include/linux/logic_pio.h \
+    $(wildcard include/config/INDIRECT_PIO) \
+  /usr/src/linux-headers-6.12.73+deb13-common/include/linux/fwnode.h \
+  /data/share/cyber/CoKernel/module/../include/shared.h \
+  /data/share/cyber/CoKernel/module/memory.h \
   /data/share/cyber/CoKernel/module/pagetable.h \
   /data/share/cyber/CoKernel/module/execution.h \
   /data/share/cyber/CoKernel/module/resolve.h \

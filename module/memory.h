@@ -30,4 +30,7 @@ void *ck_get_trampoline_va(void);
 /* Get trampoline page physical address */
 phys_addr_t ck_get_trampoline_phys(void);
 
+/* Get physical address of the comm page (last page of allocation) */
+phys_addr_t ck_get_comm_page_phys(void);
+
 #endif /* _COKERNEL_MEMORY_H */

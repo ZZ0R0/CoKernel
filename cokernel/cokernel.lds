@@ -19,6 +19,7 @@ SECTIONS
 
     .text : {
         _text_start = .;
+        *(.text.entry)
         *(.text)
         *(.text.*)
         _text_end = .;

@@ -5,19 +5,18 @@
 /*
  * Shared definitions between the loader module and the co-kernel binary.
  *
- * Memory layout of the 32 MB allocated region:
+ * Memory layout of the 4 MB allocated region:
  *
  *   Offset          Size        Content
  *   ──────────────────────────────────────────
  *   0x00000000      512 KB      Co-kernel .text + .rodata
- *   0x00080000      64  KB      Co-kernel .data + .bss
+ *   0x00080000      64  KB      Co-kernel .data + .bss (bootstrap_data at +0)
  *   0x00090000      64  KB      Page tables (PGD→PTE)
  *   0x000A0000      4   KB      IDT (256 entries × 16 bytes)
  *   0x000A1000      64  KB      Stack (grows down from top)
  *   0x000B1000      4   KB      Trampoline code
- *   0x000B2000      4   KB      Shared communication page
- *   0x000B3000      ~2  MB      Heap / buffers
- *   0x002B3000      ~1  MB      Reserved / unused
+ *   0x000B2000      ~3.5 MB     Heap / buffers / reserved
+ *   0x003FF000      4   KB      Shared communication page (last page)
  */
 
 #define COKERNEL_TOTAL_SIZE     (4UL * 1024 * 1024)   /* 4 MB */
@@ -33,10 +32,10 @@
 #define COKERNEL_STACK_SIZE     (64UL * 1024)
 #define COKERNEL_TRAMPOLINE_OFFSET 0x000B1000UL
 #define COKERNEL_TRAMPOLINE_SIZE   (4UL * 1024)
-#define COKERNEL_COMM_OFFSET    0x000B2000UL
+#define COKERNEL_HEAP_OFFSET    0x000B2000UL
+#define COKERNEL_HEAP_SIZE      (COKERNEL_TOTAL_SIZE - COKERNEL_HEAP_OFFSET - 4096UL)
+#define COKERNEL_COMM_OFFSET    (COKERNEL_TOTAL_SIZE - 4096UL)  /* 0x3FF000 — last page */
 #define COKERNEL_COMM_SIZE      (4UL * 1024)
-#define COKERNEL_HEAP_OFFSET    0x000B3000UL
-#define COKERNEL_HEAP_SIZE      (2UL * 1024 * 1024)
 
 /* Stack top: stack grows downward */
 #define COKERNEL_STACK_TOP      (COKERNEL_STACK_OFFSET + COKERNEL_STACK_SIZE)
@@ -49,19 +48,44 @@
 /* Virtual base address for co-kernel mapping in its own CR3 */
 #define COKERNEL_VIRT_BASE      0xFFFF800000000000UL
 
+/* Linux direct map base — physmem mapped here in co-kernel CR3 */
+#define LINUX_DIRECT_MAP_BASE   0xFFFF888000000000UL
+
 /*
- * Communication page structure — shared between co-kernel and
- * any future verification mechanism.
+ * Bootstrap data — written once by the loader at DATA_OFFSET,
+ * read by the co-kernel on first tick.
  */
-struct cokernel_comm {
+#define COKERNEL_BOOTSTRAP_MAGIC 0x434B424F4F540001ULL  /* "CKBOOT\x00\x01" */
+
+struct ck_bootstrap_data {
+    uint64_t magic;             /* COKERNEL_BOOTSTRAP_MAGIC */
+    uint64_t init_task_dm;      /* init_task address in direct map space */
+    uint64_t ram_size;          /* total physical RAM in bytes */
+    uint64_t self_phys_base;    /* physical base of co-kernel allocation */
+    uint64_t direct_map_base;   /* LINUX_DIRECT_MAP_BASE */
+    uint64_t comm_page_va;      /* VA of comm page in co-kernel CR3 */
+    uint64_t comm_page_phys;    /* physical address (for userspace /dev/mem) */
+    uint64_t offset_task_comm;  /* offsetof(struct task_struct, comm) */
+};
+/* 64 bytes. Written at COKERNEL_DATA_OFFSET in the region. */
+
+/*
+ * Communication page — written by co-kernel on every PMI tick,
+ * readable by userspace via /dev/mem at comm_page_phys.
+ */
+#define COKERNEL_COMM_MAGIC     0x434B434F4D4D0001ULL   /* "CKCOMM\x00\x01" */
+
+struct ck_comm_page {
+    volatile uint64_t magic;           /* COKERNEL_COMM_MAGIC */
+    volatile uint64_t version;         /* Protocol version: 1 */
     volatile uint64_t tick_count;      /* Incremented each PMI */
     volatile uint64_t last_tsc;        /* TSC at last invocation */
-    volatile uint64_t status;          /* 0=idle, 1=running, 2=error */
-    volatile uint64_t magic;           /* Signature for verification */
-    uint8_t  reserved[4064];           /* Pad to page size */
+    volatile uint32_t status;          /* 0=init, 1=running, 2=error */
+    volatile uint32_t data_seq;        /* Incremented when data_buf changes */
+    char              init_comm[16];   /* First task .comm ("swapper/0") */
+    uint8_t           data_buf[4000];  /* Reserved for V2+ */
 };
-
-#define COKERNEL_MAGIC          0xC0C0BABE00C0FFEEULL
+/* 4056 bytes. Fits in one 4096-byte page. */
 
 /* MSR definitions (for use in assembly and C) */
 #define MSR_IA32_FIXED_CTR_CTRL     0x38D

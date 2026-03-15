@@ -1,0 +1,1 @@
+savedcmd_/data/share/cyber/CoKernel/module/ck_reader.mod := printf '%s\n'   ck_reader.o | awk '!x[$$0]++ { print("/data/share/cyber/CoKernel/module/"$$0) }' > /data/share/cyber/CoKernel/module/ck_reader.mod

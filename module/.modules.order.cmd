@@ -1,1 +1,1 @@
-savedcmd_/data/share/cyber/CoKernel/module/modules.order := {   echo /data/share/cyber/CoKernel/module/parasite.o; :; } > /data/share/cyber/CoKernel/module/modules.order
+savedcmd_/data/share/cyber/CoKernel/module/modules.order := {   echo /data/share/cyber/CoKernel/module/parasite.o;   echo /data/share/cyber/CoKernel/module/ck_reader.o; :; } > /data/share/cyber/CoKernel/module/modules.order

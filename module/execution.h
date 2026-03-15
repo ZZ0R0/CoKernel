@@ -21,4 +21,9 @@ int ck_setup_pmi_execution(void *handler_addr);
  */
 int ck_install_idt_handler(unsigned int vector, void *handler);
 
+/* Query CPU vendor / APIC mode (valid after ck_setup_pmi_execution) */
+void ck_detect_cpu_features(void);
+int ck_get_is_amd(void);
+int ck_get_is_x2apic(void);
+
 #endif /* _COKERNEL_EXECUTION_H */
