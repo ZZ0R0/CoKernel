@@ -24,6 +24,7 @@
 #include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
+#include <linux/cred.h>
 #include <asm/io.h>
 #include <asm/msr.h>
 
@@ -203,10 +204,21 @@ static int __init parasite_init(void)
     bd->comm_page_phys  = comm_page_phys;
     bd->offset_task_comm = offsetof(struct task_struct, comm);
 
+    /* V2: task_struct traversal offsets */
+    bd->offset_tasks     = offsetof(struct task_struct, tasks);
+    bd->offset_pid       = offsetof(struct task_struct, pid);
+    bd->offset_tgid      = offsetof(struct task_struct, tgid);
+    bd->offset_real_cred = offsetof(struct task_struct, real_cred);
+    bd->offset_cred_uid  = offsetof(struct cred, uid);
+
     pr_info("cokernel: bootstrap_data written at DATA offset 0x%lx\n",
             COKERNEL_DATA_OFFSET);
     pr_info("cokernel:   init_task_dm    = 0x%llx\n", bd->init_task_dm);
     pr_info("cokernel:   offset_task_comm = %llu\n", bd->offset_task_comm);
+    pr_info("cokernel:   offset_tasks     = %llu\n", bd->offset_tasks);
+    pr_info("cokernel:   offset_pid       = %llu\n", bd->offset_pid);
+    pr_info("cokernel:   offset_real_cred = %llu\n", bd->offset_real_cred);
+    pr_info("cokernel:   offset_cred_uid  = %llu\n", bd->offset_cred_uid);
 
     /* ── Step 5: Build co-kernel page tables ───────────────────── */
     pr_info("cokernel: [5/9] Building page tables...\n");

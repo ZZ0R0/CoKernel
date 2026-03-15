@@ -58,6 +58,7 @@
 #define COKERNEL_BOOTSTRAP_MAGIC 0x434B424F4F540001ULL  /* "CKBOOT\x00\x01" */
 
 struct ck_bootstrap_data {
+    /* V1 fields (positions FIXED — do NOT reorder) */
     uint64_t magic;             /* COKERNEL_BOOTSTRAP_MAGIC */
     uint64_t init_task_dm;      /* init_task address in direct map space */
     uint64_t ram_size;          /* total physical RAM in bytes */
@@ -66,8 +67,15 @@ struct ck_bootstrap_data {
     uint64_t comm_page_va;      /* VA of comm page in co-kernel CR3 */
     uint64_t comm_page_phys;    /* physical address (for userspace /dev/mem) */
     uint64_t offset_task_comm;  /* offsetof(struct task_struct, comm) */
+
+    /* V2 additions: task_struct traversal offsets */
+    uint64_t offset_tasks;      /* offsetof(struct task_struct, tasks) */
+    uint64_t offset_pid;        /* offsetof(struct task_struct, pid) */
+    uint64_t offset_tgid;       /* offsetof(struct task_struct, tgid) */
+    uint64_t offset_real_cred;  /* offsetof(struct task_struct, real_cred) */
+    uint64_t offset_cred_uid;   /* offsetof(struct cred, uid) */
 };
-/* 64 bytes. Written at COKERNEL_DATA_OFFSET in the region. */
+/* V2: 104 bytes (13 × 8). Written at COKERNEL_DATA_OFFSET. */
 
 /*
  * Communication page — written by co-kernel on every PMI tick,
@@ -83,9 +91,30 @@ struct ck_comm_page {
     volatile uint32_t status;          /* 0=init, 1=running, 2=error */
     volatile uint32_t data_seq;        /* Incremented when data_buf changes */
     char              init_comm[16];   /* First task .comm ("swapper/0") */
-    uint8_t           data_buf[4000];  /* Reserved for V2+ */
+    uint8_t           data_buf[4000];  /* V2: process snapshot data */
 };
 /* 4056 bytes. Fits in one 4096-byte page. */
+
+/*
+ * Process snapshot entry (V2) — one per process in data_buf.
+ *
+ * data_buf layout:
+ *   [0..3]   uint32_t nr_tasks
+ *   [4..7]   uint32_t reserved
+ *   [8..]    ck_process_entry[0..N-1]
+ */
+#define SNAPSHOT_INTERVAL       512    /* take snapshot every N ticks */
+#define MAX_SNAPSHOT_PROCS      124    /* (4000 - 8) / 32 = 124 */
+#define MAX_TASK_WALK           1024   /* safety limit on list traversal */
+
+struct ck_process_entry {
+    int32_t  pid;
+    int32_t  tgid;
+    uint32_t uid;
+    uint32_t reserved;
+    char     comm[16];
+};
+/* 32 bytes per entry. */
 
 /* MSR definitions (for use in assembly and C) */
 #define MSR_IA32_FIXED_CTR_CTRL     0x38D
