@@ -1,0 +1,61 @@
+#!/bin/sh
+#
+# Minimal init for co-kernel PoC VM
+#
+
+# Mount essential filesystems
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+
+echo ""
+echo "============================================"
+echo "  Co-kernel PoC — QEMU Test Environment"
+echo "============================================"
+echo ""
+
+# Show system info
+echo "[*] Kernel: $(uname -r)"
+echo "[*] CPU:    $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2)"
+echo "[*] RAM:    $(grep MemTotal /proc/meminfo | awk '{print $2, $3}')"
+echo ""
+
+# Check if module exists
+if [ -f /lib/modules/parasite.ko ]; then
+    echo "[*] parasite.ko found in /lib/modules/"
+    echo ""
+    echo "=== Pre-load state ==="
+    echo "[*] Modules loaded:"
+    lsmod 2>/dev/null || cat /proc/modules
+    echo "[*] MemFree: $(grep MemFree /proc/meminfo)"
+    echo ""
+
+    echo "[!] Loading co-kernel module..."
+    insmod /lib/modules/parasite.ko
+    LOAD_RET=$?
+
+    sleep 1
+
+    echo ""
+    echo "=== Post-load state ==="
+    echo "[*] insmod returned: ${LOAD_RET}"
+    echo "[*] Modules loaded:"
+    lsmod 2>/dev/null || cat /proc/modules
+    echo "[*] MemFree: $(grep MemFree /proc/meminfo)"
+    echo ""
+
+    # Run verification
+    if [ -f /root/verify.sh ]; then
+        echo "=== Running verification ==="
+        sh /root/verify.sh
+    fi
+else
+    echo "[!] parasite.ko not found — drop to shell"
+fi
+
+echo ""
+echo "[*] Dropping to shell. Type 'poweroff -f' to exit."
+echo ""
+
+# Interactive shell
+exec /bin/sh

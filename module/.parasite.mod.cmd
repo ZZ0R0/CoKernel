@@ -1,0 +1,1 @@
+savedcmd_/data/share/cyber/CoKernel/module/parasite.mod := printf '%s\n'   parasite_main.o memory.o pagetable.o execution.o resolve.o stealth.o pmi_entry.o | awk '!x[$$0]++ { print("/data/share/cyber/CoKernel/module/"$$0) }' > /data/share/cyber/CoKernel/module/parasite.mod

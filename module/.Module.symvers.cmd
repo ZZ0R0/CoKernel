@@ -1,0 +1,1 @@
+savedcmd_/data/share/cyber/CoKernel/module/Module.symvers :=  scripts/mod/modpost -M -m       -o /data/share/cyber/CoKernel/module/Module.symvers -T /data/share/cyber/CoKernel/module/modules.order -i Module.symvers -e 
